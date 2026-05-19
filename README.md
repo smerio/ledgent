@@ -141,10 +141,18 @@ Drop `--dry-run` to perform the actual import.
 | `/balance` | Assets grouped by location with USD valuation |
 | `/pnl` | Realized PnL: L1 (asset) + L2 (forex) − fees |
 | `/unrealized` | Unrealized PnL using live CoinGecko prices |
+| `/alert <asset> <cond>` | Set custom price alert (e.g. `/alert BTC > 75000` or `/alert SOL 5%`, or `/alert clear <asset>`) |
+| `/alerts` | List all active custom price alert conditions |
 | `/history [N]` | Last N transactions (default 10) |
 | `/fees` | Total fees paid, by asset |
 | `/stats` | DCA frequency, average buy price |
 | `/help` | This list |
+
+### Smart Price Alerting & Volatility Monitor
+The bot includes a hybrid background alerting system triggered every 15 minutes by AWS EventBridge Scheduler:
+- **Custom Price Triggers**: Get notified once when prices cross a target threshold (`/alert BTC > 75000`) or swing from a custom baseline percentage (`/alert SOL 5%`). The alert is auto-deleted after it fires.
+- **Auto Volatility Warnings**: Automatically alerts you on held assets (positive balances in your FIFO lots) if they experience a $\ge 5\%$ swing in 24 hours.
+- **Smart Suppression**: Employs a 12-hour spam suppression window per asset, which is automatically bypassed if the 24h price swing moves by an additional $\ge 2\%$ absolute percentage delta to keep you updated on rapid movements.
 
 Natural language examples — the LLM will infer the operation type:
 
@@ -176,16 +184,16 @@ message and it will appear in subsequent `/balance` outputs.
 
 ## Cost estimate
 
-For a single user logging ~30 messages a month:
+For a single user logging ~30 messages and utilizing 15-minute price checks (~2,880 queries) a month:
 
 | Resource | Volume | AWS cost (us-east-1, beyond free tier) |
 |---|---|---|
-| Lambda invocations | ~150/mo @ 512 MB, <1 s avg | < $0.01 |
+| Lambda invocations | ~3,000/mo @ 512 MB, <1 s avg | < $0.05 |
 | DynamoDB | <1 GB, PAY_PER_REQUEST | < $0.10 |
 | API Gateway HTTP | ~150 requests | < $0.01 |
 | CloudWatch Logs | retention 14 days | < $0.05 |
-| EventBridge | 4 schedules/mo | $0.00 |
-| **Total** | | **well under $0.20/mo**, $0 within free tier |
+| EventBridge | ~2,884 triggers/mo | $0.00 |
+| **Total** | | **well under $0.25/mo**, $0 within free tier |
 
 LLM costs depend on provider — Claude Haiku 4.5 is typically <$0.001 per parse.
 
