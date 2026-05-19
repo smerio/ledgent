@@ -33,6 +33,7 @@ Price cache:
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import logging
 import os
 import time
@@ -479,7 +480,63 @@ def acquire_update_lock(user_id: int | str, update_id: int | str) -> bool:
         )
         return True
     except Exception as e:
-        if hasattr(e, "response") and e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-            return False
-        logger.warning("Failed to acquire update lock: %s", e)
-        return True
+           if hasattr(e, "response") and e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+               return False
+           logger.warning("Failed to acquire update lock: %s", e)
+           return True
+
+
+# ---------------------------------------------------------------------------
+# Custom Price Alerts & Volatility Suppressions
+# ---------------------------------------------------------------------------
+
+
+def put_custom_alert(
+    user_id: int | str,
+    asset: str,
+    condition: str,
+    target: Decimal,
+    baseline_price: Decimal | None = None,
+) -> dict:
+    """Save a custom user price/percent alert."""
+    ulid = str(ULID())
+    item = {
+        "PK": _user_pk(user_id),
+        "SK": f"ALERT#{asset.upper()}#{ulid}",
+        "type": "alert",
+        "alert_id": ulid,
+        "asset": asset.upper(),
+        "condition": condition,
+        "target": _to_decimal(target),
+        "baseline_price": _to_decimal(baseline_price) if baseline_price is not None else None,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _table.put_item(Item=item)
+    return item
+
+
+def list_custom_alerts(user_id: int | str, asset: str | None = None) -> list[dict]:
+    """Retrieve all custom alerts for a user, optionally filtered by asset."""
+    pk = _user_pk(user_id)
+    if asset:
+        key_cond = Key("PK").eq(pk) & Key("SK").begins_with(f"ALERT#{asset.upper()}#")
+    else:
+        key_cond = Key("PK").eq(pk) & Key("SK").begins_with("ALERT#")
+    resp = _table.query(KeyConditionExpression=key_cond)
+    return resp.get("Items", [])
+
+
+def delete_custom_alert(user_id: int | str, asset: str, alert_id: str) -> None:
+    """Delete a specific custom alert."""
+    _table.delete_item(Key={"PK": _user_pk(user_id), "SK": f"ALERT#{asset.upper()}#{alert_id}"})
+
+
+def clear_custom_alerts_for_asset(user_id: int | str, asset: str) -> int:
+    """Delete all custom alerts for a specific asset. Returns number deleted."""
+    alerts = list_custom_alerts(user_id, asset)
+    if not alerts:
+        return 0
+    with _table.batch_writer() as bw:
+        for a in alerts:
+            bw.delete_item(Key={"PK": a["PK"], "SK": a["SK"]})
+    return len(alerts)

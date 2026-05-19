@@ -55,3 +55,10 @@ variable "nudge_schedule_expression" {
   type        = string
   default     = "cron(0 9 ? * MON *)"
 }
+
+variable "alert_schedule_expression" {
+  description = "EventBridge Scheduler rate expression for checking price alerts."
+  type        = string
+  default     = "rate(15 minutes)"
+}
+

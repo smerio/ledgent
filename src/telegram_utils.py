@@ -264,6 +264,12 @@ HELP_TEXT = (
     "/context — view persistent advisor instruction\n"
     "/context set <text> — add note injected into every /ask and /strategy\n"
     "/context clear — remove advisor note\n\n"
+    "*Alerts*\n"
+    "/alert <asset> > <price> — alert when asset crosses above price\n"
+    "/alert <asset> < <price> — alert when asset crosses below price\n"
+    "/alert <asset> <pct>% — alert on relative percent movement (e.g. 5%)\n"
+    "/alert clear <asset> — remove active alerts for an asset\n"
+    "/alerts — list all active custom price alerts\n\n"
     "*Funds*\n"
     "/funds — overview of all virtual funds with P&L\n"
     "/fund <slug> — detail view + contribution history\n"
@@ -283,3 +289,64 @@ HELP_TEXT = (
     "  `sold 1000 usdt for 871 eur`\n"
     "  `ledger btc = 1.23456789` _(reconcile a balance)_\n"
 )
+
+
+def format_alerts_list(alerts: list[dict]) -> str:
+    """Render a /alerts reply."""
+    if not alerts:
+        return "_No active price alerts set._\n\nUse `/alert <asset> > <price>` or `/alert <asset> 5%` to create one."
+    lines = ["*Active Price Alerts*"]
+    by_asset: dict[str, list[dict]] = {}
+    for a in alerts:
+        asset = a.get("asset", "?").upper()
+        by_asset.setdefault(asset, []).append(a)
+    for asset in sorted(by_asset):
+        lines.append(f"\n*{asset}*")
+        for a in sorted(by_asset[asset], key=lambda x: x.get("created_at", "")):
+            cond = a.get("condition", "")
+            target = Decimal(str(a.get("target", 0)))
+            baseline = a.get("baseline_price")
+            alert_id = a.get("alert_id", "")
+            
+            if cond == ">":
+                lines.append(f"  • Crosses above `${_fmt(target)}`  `[ID: {alert_id[:4]}]`")
+            elif cond == "<":
+                lines.append(f"  • Crosses below `${_fmt(target)}`  `[ID: {alert_id[:4]}]`")
+            elif cond == "%":
+                base_str = f" (base: `${_fmt(baseline)}`)" if baseline else ""
+                lines.append(f"  • Moves by `{_fmt(target)}%`{base_str}  `[ID: {alert_id[:4]}]`")
+    return "\n".join(lines)
+
+
+def format_custom_alert_triggered(
+    asset: str,
+    condition: str,
+    target: Decimal,
+    current_price: Decimal,
+    baseline_price: Decimal | None = None,
+) -> str:
+    """Format triggered custom price alert."""
+    title = "🔔 *Price Alert Triggered!*"
+    if condition == ">":
+        details = f"*{asset}* crossed above your target of `${_fmt(target)}`.\n• Current Price: `${_fmt(current_price)} USD`"
+    elif condition == "<":
+        details = f"*{asset}* crossed below your target of `${_fmt(target)}`.\n• Current Price: `${_fmt(current_price)} USD`"
+    elif condition == "%":
+        change = ((current_price - Decimal(str(baseline_price))) / Decimal(str(baseline_price)) * 100) if baseline_price else Decimal("0")
+        sign = "+" if change >= 0 else ""
+        details = f"*{asset}* moved by your target of `{_fmt(target)}%`.\n• Current Price: `${_fmt(current_price)} USD` ({sign}{_fmt(change)}% from `${_fmt(baseline_price)}`)"
+    else:
+        details = f"*{asset}* met your alert condition.\n• Current Price: `${_fmt(current_price)} USD`"
+    return f"{title}\n\n{details}"
+
+
+def format_volatility_alert(asset: str, change_24h: Decimal, current_price: Decimal) -> str:
+    """Format volatility warning message."""
+    emoji = "🔴" if change_24h < 0 else "🟢"
+    sign = "+" if change_24h >= 0 else ""
+    return (
+        f"⚠️ *{asset} Volatility Alert* {emoji}\n\n"
+        f"*{asset}* has moved by *{sign}{_fmt(change_24h)}%* in the last 24 hours!\n"
+        f"• Current Price: `${_fmt(current_price)} USD`"
+    )
+

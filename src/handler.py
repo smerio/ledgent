@@ -34,6 +34,12 @@ COINGECKO_IDS = {
 
 def lambda_handler(event, context):
     """API Gateway → Telegram webhook entry (fast path) or async processor (slow path)."""
+    # EventBridge schedule price alert check
+    if "_alert_check" in event:
+        from alerts import run_price_alerts
+        run_price_alerts()
+        return {"statusCode": 200, "body": "OK"}
+
     # Async processing path: invoked by the webhook Lambda, no API GW time constraint.
     if "_proc" in event:
         p = event["_proc"]
@@ -105,6 +111,12 @@ def _route(text: str, chat_id: int, user_id: int) -> None:
     if lower.startswith("/help") or lower == "/start":
         tg.send_message(chat_id, tg.HELP_TEXT)
         return
+    if lower.startswith("/alerts"):
+        _cmd_alerts(chat_id, user_id)
+        return
+    if lower.startswith("/alert"):
+        _cmd_alert(text, chat_id, user_id)
+        return
     if lower.startswith("/balance"):
         _cmd_balance(chat_id, user_id, base_currency)
         return
@@ -163,6 +175,140 @@ def _route(text: str, chat_id: int, user_id: int) -> None:
         return
 
     _cmd_freeform(text, chat_id, user_id, base_currency)
+
+
+def _cmd_alerts(chat_id: int, user_id: int) -> None:
+    """`/alerts` — list all active custom price alerts."""
+    try:
+        alerts = database.list_custom_alerts(user_id)
+        text = tg.format_alerts_list(alerts)
+        tg.send_message(chat_id, text)
+    except Exception as e:
+        logger.exception("Failed to query alerts")
+        tg.send_message(chat_id, f"❌ _Error retrieving alerts: {e}_")
+
+
+def _cmd_alert(text: str, chat_id: int, user_id: int) -> None:
+    """`/alert` — set or clear price alerts."""
+    parts = text.strip().split()
+    if len(parts) < 2:
+        tg.send_message(chat_id, (
+            "🔔 *Price Alerts Help*\n\n"
+            "Use the following formats to manage alerts:\n"
+            "• `/alert <asset> > <price>` — Crosses above (e.g. `/alert BTC > 75000`)\n"
+            "• `/alert <asset> < <price>` — Crosses below (e.g. `/alert BTC < 65000`)\n"
+            "• `/alert <asset> <pct>%` — Relative percent movement (e.g. `/alert BTC 5%`)\n"
+            "• `/alert clear <asset>` — Clear all alerts for an asset (e.g. `/alert clear BTC`)\n"
+            "• `/alerts` — List all your active alerts"
+        ))
+        return
+
+    # Check for "clear"
+    if parts[1].lower() == "clear":
+        if len(parts) < 3:
+            tg.send_message(chat_id, "❌ Please specify an asset ticker to clear alerts for (e.g. `/alert clear BTC`).")
+            return
+        asset = parts[2].upper()
+        try:
+            count = database.clear_custom_alerts_for_asset(user_id, asset)
+            tg.send_message(chat_id, f"🧹 Cleared {count} active alert(s) for *{asset}*.")
+        except Exception as e:
+            logger.exception("Failed to clear alerts")
+            tg.send_message(chat_id, f"❌ _Error clearing alerts: {e}_")
+        return
+
+    # Set custom price alert
+    asset = parts[1].upper()
+    if asset not in COINGECKO_IDS:
+        tg.send_message(chat_id, f"❌ Unsupported or invalid asset ticker: *{asset}*.\nSupported: {', '.join(sorted(COINGECKO_IDS.keys()))}")
+        return
+
+    # Fetch current spot price for validation and baseline
+    try:
+        prices = _live_prices(user_id, [asset], "USD")
+        if asset not in prices:
+            tg.send_message(chat_id, f"❌ Could not fetch price for *{asset}*. Please try again later.")
+            return
+        current_price = prices[asset]
+    except Exception as e:
+        logger.exception("Failed to fetch price validation")
+        tg.send_message(chat_id, f"❌ _Error fetching validation price: {e}_")
+        return
+
+    if len(parts) == 3:
+        # Relative percent alert: "/alert BTC 5%" or "/alert BTC 5"
+        arg = parts[2]
+        pct_str = arg.rstrip("%")
+        try:
+            pct = Decimal(pct_str)
+        except ValueError:
+            tg.send_message(chat_id, f"❌ Invalid price or percentage: `{arg}`")
+            return
+
+        target_pct = abs(pct)
+        if target_pct <= Decimal("0"):
+            tg.send_message(chat_id, "❌ Percentage trigger must be greater than 0%.")
+            return
+
+        try:
+            database.put_custom_alert(
+                user_id=user_id,
+                asset=asset,
+                condition="%",
+                target=target_pct,
+                baseline_price=current_price
+            )
+            tg.send_message(chat_id, (
+                f"🔔 *Custom Alert Set!*\n\n"
+                f"Asset: *{asset}*\n"
+                f"Trigger: Moves by *{target_pct}%*\n"
+                f"Baseline Price: `${tg._fmt(current_price)} USD`"
+            ))
+        except Exception as e:
+            logger.exception("Failed to save custom alert")
+            tg.send_message(chat_id, f"❌ _Error setting custom alert: {e}_")
+        return
+
+    elif len(parts) == 4:
+        # Price target alert: "/alert BTC > 75000" or "/alert BTC < 60000"
+        operator = parts[2]
+        price_str = parts[3]
+        if operator not in (">", "<"):
+            tg.send_message(chat_id, f"❌ Invalid operator `{operator}`. Use `>` or `<`.")
+            return
+
+        try:
+            target_price = Decimal(price_str)
+        except ValueError:
+            tg.send_message(chat_id, f"❌ Invalid target price: `{price_str}`")
+            return
+
+        if target_price <= Decimal("0"):
+            tg.send_message(chat_id, "❌ Target price must be greater than 0.")
+            return
+
+        try:
+            database.put_custom_alert(
+                user_id=user_id,
+                asset=asset,
+                condition=operator,
+                target=target_price,
+                baseline_price=current_price
+            )
+            op_name = "crosses above" if operator == ">" else "crosses below"
+            tg.send_message(chat_id, (
+                f"🔔 *Custom Alert Set!*\n\n"
+                f"Asset: *{asset}*\n"
+                f"Trigger: Price {op_name} `${tg._fmt(target_price)} USD`\n"
+                f"Current Price: `${tg._fmt(current_price)} USD`"
+            ))
+        except Exception as e:
+            logger.exception("Failed to save custom alert")
+            tg.send_message(chat_id, f"❌ _Error setting custom alert: {e}_")
+        return
+
+    else:
+        tg.send_message(chat_id, "❌ Invalid syntax. Use `/alert <asset> > <price>`, `/alert <asset> 5%`, or `/alert clear <asset>`.")
 
 
 def _parse_int_arg(text: str, default: int) -> int:

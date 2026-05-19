@@ -277,7 +277,10 @@ resource "aws_iam_role" "scheduler" {
 data "aws_iam_policy_document" "scheduler_invoke" {
   statement {
     actions   = ["lambda:InvokeFunction"]
-    resources = [aws_lambda_function.nudge.arn]
+    resources = [
+      aws_lambda_function.nudge.arn,
+      aws_lambda_function.bot.arn
+    ]
   }
 }
 
@@ -303,3 +306,21 @@ resource "aws_scheduler_schedule" "nudge" {
     role_arn = aws_iam_role.scheduler.arn
   }
 }
+
+resource "aws_scheduler_schedule" "price_alerts" {
+  name = "${var.project_name}-price-alerts"
+
+  flexible_time_window {
+    mode = "OFF"
+  }
+
+  schedule_expression          = var.alert_schedule_expression
+  schedule_expression_timezone = "UTC"
+
+  target {
+    arn      = aws_lambda_function.bot.arn
+    role_arn = aws_iam_role.scheduler.arn
+    input    = jsonencode({ "_alert_check" = true })
+  }
+}
+
