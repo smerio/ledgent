@@ -1,0 +1,35 @@
+.env
+.env.local
+*.tfstate
+*.tfstate.backup
+**/.terraform/
+.terraform.lock.hcl
+terraform/terraform.tfvars
+terraform/.build/
+layer/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+.DS_Store
+*.zip
+lambda_package/
+
+# Personal financial history and session notes — never commit
+*.csv
+*.xlsx
+history.log
+memory.md
+
+# Agent briefing docs — local only
+AGENT_SPEC.md
+WEBSITE_BRIEF.md
+
+# Import/utility scripts are personal-data-specific; not for public repo
+scripts/

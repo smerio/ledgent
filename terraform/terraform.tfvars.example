@@ -1,0 +1,7 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored.
+aws_region               = "eu-central-1"
+allowed_telegram_user_id = "REPLACE_WITH_NUMERIC_TG_USER_ID"
+telegram_bot_token       = "REPLACE_WITH_BOTFATHER_TOKEN"
+llm_provider             = "claude" # gemini | openai | claude
+llm_api_key              = "REPLACE_WITH_LLM_API_KEY"
+base_currency            = "USD"

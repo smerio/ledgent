@@ -1,0 +1,12 @@
+# Core runtime deps (always needed)
+boto3>=1.34            # already in the Lambda runtime; listed for local CLI use
+requests>=2.32         # HTTP for Telegram, CoinGecko, and Gemini REST
+python-ulid>=2.0       # IDs for transaction sort keys
+python-dateutil>=2.9   # robust timestamp parsing in scheduler/importer
+typing_extensions>=4.0 # required by python-ulid even on Python 3.12
+
+# Optional LLM SDKs — install only the one matching LLM_PROVIDER.
+# Gemini does NOT need a SDK; the parser hits the REST API via `requests`.
+anthropic>=0.40        # required if LLM_PROVIDER=claude (default)
+python-dotenv>=1.0     # loads .env for local script runs (batch_upload, etc.)
+# openai>=1.50         # uncomment if LLM_PROVIDER=openai
