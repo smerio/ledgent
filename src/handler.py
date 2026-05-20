@@ -418,6 +418,16 @@ def _cmd_fees(chat_id: int, user_id: int) -> None:
 
 
 def _cmd_stats(chat_id: int, user_id: int, asset: str | None = None) -> None:
+    def _D(val) -> Decimal:
+        if val is None or val == "":
+            return Decimal("0")
+        if isinstance(val, Decimal):
+            return val
+        try:
+            return Decimal(str(val))
+        except Exception:
+            return Decimal("0")
+
     txs = database.query_transactions(user_id, asset=asset) if asset else database.query_transactions(user_id)
     buys = [t for t in txs if t.get("operation") in ("P2P_BUY", "SPOT_BUY")]
     if asset:
@@ -446,18 +456,68 @@ def _cmd_stats(chat_id: int, user_id: int, asset: str | None = None) -> None:
     # Weighted avg price only makes sense per-asset since different buys
     # quote in different units (RUB/USDT, USDT/BTC, RUB/BTC, ...).
     if asset:
-        total_amount = sum(Decimal(str(b.get("amount", 0))) for b in buys)
-        total_cost = sum(
-            Decimal(str(b.get("amount", 0))) * Decimal(str(b.get("price", 0)))
+        # Build price index chronologically over all user transactions
+        # to value quote currencies accurately.
+        all_txs = database.query_transactions(user_id)
+        prices_by_asset: dict[str, list[tuple[str, Decimal]]] = {}
+        for tx in all_txs:
+            op = tx.get("operation")
+            tx_asset = tx.get("asset")
+            p = _D(tx.get("price"))
+            usd_per_quote = accounting._usd_per_quote(tx)
+            ts = tx.get("timestamp", "")
+            if op in ("P2P_BUY", "P2P_SELL", "SPOT_BUY", "SPOT_SELL") and p > Decimal("0") and usd_per_quote > Decimal("0"):
+                prices_by_asset.setdefault(tx_asset, []).append((ts, p * usd_per_quote))
+                
+        for a in prices_by_asset:
+            prices_by_asset[a].sort(key=lambda x: x[0])
+
+        def _get_usd_per_quote_inferred(tx: dict) -> Decimal:
+            usd_per_quote = accounting._usd_per_quote(tx)
+            if usd_per_quote > Decimal("0"):
+                return usd_per_quote
+            tx_asset = tx.get("asset")
+            p = _D(tx.get("price"))
+            ts = tx.get("timestamp", "")
+            if tx_asset in accounting._USD_PEGGED and p > Decimal("0"):
+                return Decimal("1") / p
+            if p > Decimal("0") and tx_asset not in accounting._USD_PEGGED:
+                usd_asset_price = accounting._get_historical_price(tx_asset, ts, prices_by_asset)
+                if usd_asset_price and usd_asset_price > Decimal("0"):
+                    return usd_asset_price / p
+            return Decimal("0")
+
+        quotes = [b.get("quote_asset") for b in buys if b.get("quote_asset")]
+        primary_quote = max(set(quotes), key=quotes.count) if quotes else "USD"
+
+        total_amount = sum(_D(b.get("amount")) for b in buys)
+        total_cost_usd = sum(
+            _D(b.get("amount")) * _D(b.get("price")) * _get_usd_per_quote_inferred(b)
             for b in buys
         )
+        avg_buy_price_usd = total_cost_usd / total_amount if total_amount > 0 else Decimal("0")
+
+        # Convert back to primary quote asset using its latest rate to USD
+        if primary_quote in accounting._USD_PEGGED:
+            latest_rate = Decimal("1")
+        else:
+            primary_rates = [
+                _get_usd_per_quote_inferred(tx)
+                for tx in all_txs
+                if (tx.get("quote_asset") or "").upper() == primary_quote.upper()
+            ]
+            latest_rate = primary_rates[-1] if primary_rates else Decimal("0")
+
+        avg_buy_price = avg_buy_price_usd / latest_rate if latest_rate > Decimal("0") else avg_buy_price_usd
+
         if total_amount > 0:
-            stats["avg_buy_price"] = total_cost / total_amount
+            stats["avg_buy_price"] = avg_buy_price
         stats["asset"] = asset
-        quotes = [b.get("quote_asset") for b in buys if b.get("quote_asset")]
         if quotes:
-            stats["quote_asset"] = max(set(quotes), key=quotes.count)
+            stats["quote_asset"] = primary_quote
     tg.send_message(chat_id, tg.format_stats(stats))
+
+
 
 
 def _reconcile(chat_id: int, user_id: int, asset, location, target_amount, note: str) -> None:
