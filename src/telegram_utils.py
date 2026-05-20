@@ -1,6 +1,7 @@
 """Telegram Bot API helpers and message formatters."""
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -13,20 +14,35 @@ _API = "https://api.telegram.org/bot{token}/{method}"
 
 
 def send_message(chat_id: int | str, text: str, parse_mode: str = "Markdown") -> None:
-    import logging
     token = os.environ["TELEGRAM_BOT_TOKEN"]
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+
     resp = requests.post(
         _API.format(token=token, method="sendMessage"),
-        json={
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": parse_mode,
-            "disable_web_page_preview": True,
-        },
+        json=payload,
         timeout=10,
     )
     data = resp.json()
     if not data.get("ok"):
+        # If Markdown parsing fails, fallback to plain text so the user at least gets the message!
+        if parse_mode == "Markdown" and "parse" in data.get("description", "").lower():
+            logging.getLogger(__name__).warning("Telegram Markdown parsing failed, retrying in plain text...")
+            fallback_payload = payload.copy()
+            fallback_payload.pop("parse_mode", None)
+            resp = requests.post(
+                _API.format(token=token, method="sendMessage"),
+                json=fallback_payload,
+                timeout=10,
+            )
+            data = resp.json()
+            if data.get("ok"):
+                return
         logging.getLogger(__name__).error("Telegram sendMessage failed: %s", data)
 
 
