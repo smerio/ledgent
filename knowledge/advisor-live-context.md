@@ -1,9 +1,8 @@
 # Advisor Context: Per-Lot Detail and Live Prices
 
-Added 2026-05-19. Documents what `_build_portfolio_context()` now includes
-and why, plus the companion `/sim sell` command.
+Updated 2026-05-25: Added physical flow metadata ([source → destination]) to transaction history lines to eliminate LLM transfer/fiat hallucinations.
 
-## What's in the advisor context (as of 2026-05-19)
+## What's in the advisor context (as of 2026-05-25)
 
 ```
 === BALANCES ===
@@ -25,7 +24,7 @@ BTC: X.XXXX (A.AA@Exchange1, B.BB@Exchange2)
   BTC: $XX,XXX USD
 
 === LAST 25 TRANSACTIONS (newest first) ===
-  ...
+  YYYY-MM-DD [Operation] [Amount] [Asset] @ [Price] [Quote] [[Source] → [Destination]]
 
 === USER INSTRUCTIONS FOR ADVISOR ===
   (if set via /context)

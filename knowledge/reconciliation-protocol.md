@@ -59,6 +59,9 @@ If the computed delta is zero, the bot now replies:
 (Previously it showed the target, which was confusing when the command
 was mis-parsed.)
 
+### Typographic/Unicode dash normalization
+Mobile keyboards and OS autocorrect layouts often replace standard hyphens with typographic dashes (such as U+2212 minus `−`, en-dash `–`, or em-dash `—`). The `/set` parser automatically matches all such dashes and normalizes them to a standard ASCII hyphen-minus `-` before `Decimal` conversion, avoiding parsing failures.
+
 ## Operational gotchas
 
 - **Case-insensitive location merge means `/set BTC ledger 0` zeros the same
