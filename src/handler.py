@@ -325,7 +325,7 @@ def _parse_stats_asset(text: str) -> str | None:
 
 
 _SET_RE = re.compile(
-    r"^/set\s+(?P<asset>\S+)\s+(?P<location>.+?)\s+(?P<amount>-?\d+(?:\.\d+)?)\s*$",
+    r"^/set\s+(?P<asset>\S+)\s+(?P<location>.+?)\s+(?P<amount>[-−–—]?\d+(?:\.\d+)?)\s*$",
     re.IGNORECASE,
 )
 
@@ -344,16 +344,18 @@ def _cmd_set(text: str, chat_id: int, user_id: int) -> None:
         return
     asset = m.group("asset").upper()
     loc = _SET_NOISE_SUFFIX.sub("", m.group("location").strip().strip('"').strip("'"))
+    # Normalize unicode/typographic dashes to standard hyphen-minus for Decimal conversion
+    amount_str = m.group("amount").replace("−", "-").replace("–", "-").replace("—", "-")
     # Detect swapped asset/location (e.g. "/set Binance USDT 0" instead of "/set USDT Binance 0")
     state = _replay_state(user_id)
     if asset not in state.balances and loc.upper() in state.balances:
         tg.send_message(
             chat_id,
-            f"_Did you mean `/set {loc.upper()} {asset.title()} {m.group('amount')}`? "
+            f"_Did you mean `/set {loc.upper()} {asset.title()} {amount_str}`? "
             f"(asset and location appear swapped)_",
         )
         return
-    _reconcile(chat_id, user_id, asset, loc, Decimal(m.group("amount")), note="manual /set")
+    _reconcile(chat_id, user_id, asset, loc, Decimal(amount_str), note="manual /set")
 
 
 # ---------------------------------------------------------------------------
@@ -618,7 +620,10 @@ def _build_portfolio_context(state, recent_txs: list, advisor_note: str = "", li
         price = Decimal(str(tx.get("price") or 0))
         quote = tx.get("quote_asset") or ""
         price_s = f" @ {tg._fmt(price)} {quote}" if price > 0 and quote else ""
-        lines.append(f"  {ts} {op} {tg._fmt(amount)} {asset}{price_s}")
+        src = tx.get("source") or ""
+        dest = tx.get("destination") or ""
+        flow_s = f" [{src} → {dest}]" if src or dest else ""
+        lines.append(f"  {ts} {op} {tg._fmt(amount)} {asset}{price_s}{flow_s}")
 
     if live_prices:
         price_lines = [f"  {a}: ${tg._fmt(p)} USD" for a, p in sorted(live_prices.items())]

@@ -193,3 +193,93 @@ class TestStatsCommand(unittest.TestCase):
         self.assertIn("Total buys logged: `2`", formatted_message)
         self.assertIn("Average buy price: `35000` USDT", formatted_message)
 
+
+class TestSetCommandResilience(unittest.TestCase):
+
+    @patch("handler.tg.send_message")
+    @patch("handler._reconcile")
+    @patch("handler._replay_state")
+    def test_set_with_standard_minus(self, mock_replay, mock_reconcile, mock_send):
+        mock_state = MagicMock()
+        mock_state.balances = {"RUB": {"tbank": Decimal("0")}}
+        mock_replay.return_value = mock_state
+
+        handler._cmd_set(
+            text="/set RUB tbank -12345.6",
+            chat_id=123,
+            user_id=456
+        )
+
+        mock_reconcile.assert_called_once_with(
+            123, 456, "RUB", "tbank", Decimal("-12345.6"), note="manual /set"
+        )
+        mock_send.assert_not_called()
+
+    @patch("handler.tg.send_message")
+    @patch("handler._reconcile")
+    @patch("handler._replay_state")
+    def test_set_with_unicode_minus(self, mock_replay, mock_reconcile, mock_send):
+        mock_state = MagicMock()
+        mock_state.balances = {"RUB": {"tbank": Decimal("0")}}
+        mock_replay.return_value = mock_state
+
+        # Using U+2212 '−'
+        handler._cmd_set(
+            text="/set rub tbank −12345.6",
+            chat_id=123,
+            user_id=456
+        )
+
+        mock_reconcile.assert_called_once_with(
+            123, 456, "RUB", "tbank", Decimal("-12345.6"), note="manual /set"
+        )
+        mock_send.assert_not_called()
+
+    @patch("handler.tg.send_message")
+    @patch("handler._reconcile")
+    @patch("handler._replay_state")
+    def test_set_with_en_and_em_dash(self, mock_replay, mock_reconcile, mock_send):
+        mock_state = MagicMock()
+        mock_state.balances = {"RUB": {"tbank": Decimal("0")}}
+        mock_replay.return_value = mock_state
+
+        # U+2013 '–' en-dash
+        handler._cmd_set(
+            text="/set rub tbank –100",
+            chat_id=123,
+            user_id=456
+        )
+        mock_reconcile.assert_any_call(
+            123, 456, "RUB", "tbank", Decimal("-100"), note="manual /set"
+        )
+
+        # U+2014 '—' em-dash
+        handler._cmd_set(
+            text="/set rub tbank —200.5",
+            chat_id=123,
+            user_id=456
+        )
+        mock_reconcile.assert_any_call(
+            123, 456, "RUB", "tbank", Decimal("-200.5"), note="manual /set"
+        )
+
+    @patch("handler.tg.send_message")
+    @patch("handler._reconcile")
+    @patch("handler._replay_state")
+    def test_set_swapped_with_unicode_minus(self, mock_replay, mock_reconcile, mock_send):
+        mock_state = MagicMock()
+        mock_state.balances = {"RUB": {"tbank": Decimal("0")}}
+        mock_replay.return_value = mock_state
+
+        handler._cmd_set(
+            text="/set tbank rub to −12345.6",
+            chat_id=123,
+            user_id=456
+        )
+
+        mock_reconcile.assert_not_called()
+        mock_send.assert_called_once()
+        args = mock_send.call_args[0]
+        self.assertEqual(args[0], 123)
+        self.assertIn("Did you mean `/set RUB Tbank -12345.6`?", args[1])
+
