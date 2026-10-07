@@ -106,10 +106,14 @@ Capture the `webhook_url` from the outputs.
 
 ```bash
 curl -X POST "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook" \
-     -d "url=<webhook_url>"
+     -d "url=<webhook_url>" \
+     -d "secret_token=<TELEGRAM_WEBHOOK_SECRET>"
 ```
 
-The `set_webhook_command` Terraform output prints this verbatim.
+The `set_webhook_command` Terraform output prints this verbatim. With
+`telegram_webhook_secret` set, the bot rejects any webhook request that doesn't
+carry the matching `X-Telegram-Bot-Api-Secret-Token` header, so forged updates
+can't reach it even if the URL leaks.
 
 ### 5. Import historical data
 

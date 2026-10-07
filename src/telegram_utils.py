@@ -99,6 +99,7 @@ def format_pnl(
     fees_in_base: Decimal,
     base_currency: str,
     fees_by_asset: dict,
+    unmatched_sells: dict | None = None,
 ) -> str:
     net = pnl_total_usd - fees_in_base
     lines = [
@@ -112,6 +113,10 @@ def format_pnl(
         lines.append("\n_Fees by asset:_")
         for asset in sorted(fees_by_asset):
             lines.append(f"  • {asset}: `{_fmt(fees_by_asset[asset])}`")
+    if unmatched_sells:
+        lines.append("\n_⚠️ Sold without matching buys (PnL not counted for these units):_")
+        for asset in sorted(unmatched_sells):
+            lines.append(f"  • {asset}: `{_fmt(unmatched_sells[asset])}`")
     return "\n".join(lines)
 
 
@@ -296,11 +301,12 @@ HELP_TEXT = (
     "/fund delete <slug> — remove a fund (asks for confirmation)\n\n"
     "*Manage*\n"
     "/set <asset> <location> <amount> — reconcile a position to an exact value\n"
+    "/undo — remove the last transaction you logged (asks for confirmation)\n"
     "/wipe — delete all transaction history (asks for confirmation)\n"
     "/help — this message\n\n"
     "*Natural language*\n"
     "Just describe operations in plain text:\n"
-    "  `bought 1205 usdt for 82.99 rub on bybit p2p`\n"
+    "  `bought 1205 usdt for 100000 rub on bybit p2p`\n"
     "  `transferred 0.01 btc from binance to ledger, fee 0.0001`\n"
     "  `sold 1000 usdt for 871 eur`\n"
     "  `ledger btc = 1.23456789` _(reconcile a balance)_\n"

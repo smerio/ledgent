@@ -20,5 +20,5 @@ output "dynamodb_table_name" {
 
 output "set_webhook_command" {
   description = "Curl command to point Telegram at the deployed webhook."
-  value       = "curl -X POST 'https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook' -d 'url=${aws_apigatewayv2_api.webhook.api_endpoint}/webhook'"
+  value       = "curl -X POST 'https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook' -d 'url=${aws_apigatewayv2_api.webhook.api_endpoint}/webhook' -d 'secret_token=<TELEGRAM_WEBHOOK_SECRET>'"
 }

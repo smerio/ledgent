@@ -1,12 +1,13 @@
 """Lambda webhook entry point. First gate: zero-trust auth by Telegram user ID."""
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
 import re
-from datetime import datetime, timezone
-from decimal import Decimal
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 
 import requests
 
@@ -14,22 +15,23 @@ import accounting
 import database
 import parser as llm_parser
 import telegram_utils as tg
+from alerts import COINGECKO_IDS
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 
-COINGECKO_IDS = {
-    "BTC": "bitcoin",
-    "ETH": "ethereum",
-    "SOL": "solana",
-    "USDT": "tether",
-    "USDC": "usd-coin",
-    "BNB": "binancecoin",
-    "TON": "the-open-network",
-    "TRX": "tron",
-    "XRP": "ripple",
-}
+def _webhook_secret_ok(event) -> bool:
+    """Check Telegram's `X-Telegram-Bot-Api-Secret-Token` header.
+
+    Enforced only when TELEGRAM_WEBHOOK_SECRET is set, so the secret can be
+    rolled out (deploy, then setWebhook with secret_token) without downtime.
+    """
+    expected = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
+    if not expected:
+        return True
+    headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
+    return hmac.compare_digest(headers.get("x-telegram-bot-api-secret-token", ""), expected)
 
 
 def lambda_handler(event, context):
@@ -51,6 +53,11 @@ def lambda_handler(event, context):
         return {"statusCode": 200, "body": "OK"}
 
     # Webhook path: parse, authenticate, dedup — then dispatch async and return 200 fast.
+    if not _webhook_secret_ok(event):
+        # Non-2xx so a genuine Telegram update sent during the secret rollout is retried, not lost.
+        logger.warning("Webhook secret token mismatch")
+        return {"statusCode": 401, "body": "Unauthorized"}
+
     try:
         body = event.get("body") or "{}"
         update = json.loads(body)
@@ -58,6 +65,7 @@ def lambda_handler(event, context):
         logger.warning("Webhook received invalid JSON")
         return {"statusCode": 200, "body": "OK"}
 
+    is_edit = "message" not in update and "edited_message" in update
     message = update.get("message") or update.get("edited_message") or {}
     from_user = (message.get("from") or {}).get("id")
     chat_id = (message.get("chat") or {}).get("id")
@@ -82,6 +90,15 @@ def lambda_handler(event, context):
         if not database.acquire_update_lock(from_user, update_id):
             logger.info("Duplicate Telegram update %s, skipping", update_id)
             return {"statusCode": 200, "body": "OK"}
+
+    if is_edit:
+        # Re-processing an edit would log the transaction a second time.
+        tg.send_message(
+            chat_id,
+            "_Edits aren't applied to the ledger. Use /undo to remove the original, "
+            "then send the corrected message._",
+        )
+        return {"statusCode": 200, "body": "OK"}
 
     import boto3
     try:
@@ -157,6 +174,9 @@ def _route(text: str, chat_id: int, user_id: int) -> None:
         return
     if lower.startswith("/fund"):
         _cmd_fund(text, chat_id, user_id)
+        return
+    if lower.startswith("/undo"):
+        _cmd_undo(text, chat_id, user_id)
         return
     if lower.startswith("/wipe"):
         _cmd_wipe(text, chat_id, user_id)
@@ -240,8 +260,8 @@ def _cmd_alert(text: str, chat_id: int, user_id: int) -> None:
         arg = parts[2]
         pct_str = arg.rstrip("%")
         try:
-            pct = Decimal(pct_str)
-        except ValueError:
+            pct = _parse_decimal(pct_str)
+        except InvalidOperation:
             tg.send_message(chat_id, f"❌ Invalid price or percentage: `{arg}`")
             return
 
@@ -278,13 +298,25 @@ def _cmd_alert(text: str, chat_id: int, user_id: int) -> None:
             return
 
         try:
-            target_price = Decimal(price_str)
-        except ValueError:
+            target_price = _parse_decimal(price_str)
+        except InvalidOperation:
             tg.send_message(chat_id, f"❌ Invalid target price: `{price_str}`")
             return
 
         if target_price <= Decimal("0"):
             tg.send_message(chat_id, "❌ Target price must be greater than 0.")
+            return
+
+        # A "crosses" alert whose condition already holds would fire on the next check.
+        if (operator == ">" and current_price >= target_price) or (
+            operator == "<" and current_price <= target_price
+        ):
+            side = "above" if operator == ">" else "below"
+            tg.send_message(
+                chat_id,
+                f"❌ *{asset}* is already {side} `${tg._fmt(target_price)}` "
+                f"(now `${tg._fmt(current_price)}`). Pick a target on the other side of the current price.",
+            )
             return
 
         try:
@@ -309,6 +341,14 @@ def _cmd_alert(text: str, chat_id: int, user_id: int) -> None:
 
     else:
         tg.send_message(chat_id, "❌ Invalid syntax. Use `/alert <asset> > <price>`, `/alert <asset> 5%`, or `/alert clear <asset>`.")
+
+
+def _parse_decimal(s: str) -> Decimal:
+    """User-typed number → Decimal; tolerates `$` and thousand-separator commas. Raises InvalidOperation."""
+    d = Decimal(s.strip().lstrip("$").replace(",", ""))
+    if not d.is_finite():
+        raise InvalidOperation(s)
+    return d
 
 
 def _parse_int_arg(text: str, default: int) -> int:
@@ -379,6 +419,11 @@ def _cmd_pnl(chat_id: int, user_id: int, base_currency: str) -> None:
     fee_assets = list(state.fees.keys())
     valuations = _live_prices(user_id, fee_assets, base_currency)
     fees_in_base = accounting.total_fees_in(state, base_currency, valuations)
+    # Stablecoin sells beyond open lots are routine (proceeds of crypto sells
+    # don't create lots) and ~$0 PnL; only flag real assets.
+    unmatched = {
+        a: v for a, v in state.unmatched_sells.items() if a not in accounting._USD_PEGGED
+    }
     tg.send_message(
         chat_id,
         tg.format_pnl(
@@ -388,6 +433,7 @@ def _cmd_pnl(chat_id: int, user_id: int, base_currency: str) -> None:
             fees_in_base,
             base_currency,
             state.fees,
+            unmatched_sells=unmatched,
         ),
     )
 
@@ -396,15 +442,8 @@ def _cmd_unrealized(chat_id: int, user_id: int, base_currency: str) -> None:
     state = _replay_state(user_id)
     assets = list(state.open_lots.keys())
     prices = _live_prices(user_id, assets, base_currency)
-    breakdown = {}
-    for asset, lots in state.open_lots.items():
-        if asset not in prices:
-            continue
-        p = prices[asset]
-        breakdown[asset] = sum(
-            (p - lot.cost_per_unit_usd) * lot.amount_remaining for lot in lots
-        )
-    total = accounting.unrealized_pnl_usd(state, prices)
+    breakdown = accounting.unrealized_breakdown_usd(state, prices)
+    total = sum(breakdown.values(), Decimal("0"))
     tg.send_message(chat_id, tg.format_unrealized(total, base_currency, breakdown))
 
 
@@ -554,7 +593,7 @@ def _reconcile(chat_id: int, user_id: int, asset, location, target_amount, note:
         "raw_text": f"reconcile {asset}@{location} {current} → {target}: {note}",
         "imported": False,
     }
-    database.put_transaction(user_id, tx)
+    _save_logged_tx(user_id, tx)
     tg.send_message(
         chat_id,
         f"Reconciled *{asset}* @ *{location}*: `{current}` → `{target}`  "
@@ -650,7 +689,11 @@ def _cmd_sim(text: str, chat_id: int, user_id: int) -> None:
         tg.send_message(chat_id, "_Usage:_ `/sim sell <amount> <asset>`\nExample: `/sim sell 1 BTC`")
         return
 
-    sell_amount = Decimal(m.group(1))
+    try:
+        sell_amount = _parse_decimal(m.group(1))
+    except InvalidOperation:
+        tg.send_message(chat_id, f"_Invalid amount: `{m.group(1)}`_")
+        return
     asset = m.group(2).upper()
 
     state = _replay_state(user_id)
@@ -805,7 +848,9 @@ def _cmd_strategy(text: str, chat_id: int, user_id: int) -> None:
     recent_txs = database.query_transactions(user_id, limit=15, descending=True)
     cfg = database.get_user_config(user_id, "advisor_note")
     advisor_note = (cfg.get("value") or "").strip() if cfg else ""
-    context = _build_portfolio_context(state, recent_txs, advisor_note=advisor_note)
+    crypto_assets = [a for a in state.open_lots if a in COINGECKO_IDS]
+    live_prices = _live_prices(user_id, crypto_assets, "USD") if crypto_assets else {}
+    context = _build_portfolio_context(state, recent_txs, advisor_note=advisor_note, live_prices=live_prices)
     prompt = (
         f"My personal trading strategy:\n{strategy_text}\n\n"
         "Based on my portfolio and recent transactions answer:\n"
@@ -1071,10 +1116,124 @@ def _cmd_wipe(text: str, chat_id: int, user_id: int) -> None:
     )
 
 
+def _save_logged_tx(user_id: int, tx: dict) -> dict:
+    """Write a chat-logged transaction and remember it as the `/undo` target."""
+    item = database.put_transaction(user_id, tx)
+    database.put_user_config(user_id, "last_tx_sk", item["SK"])
+    return item
+
+
+def _describe_tx(tx: dict) -> str:
+    """Multi-line summary of a stored/parsed transaction for confirmations."""
+    op = tx.get("operation", "?")
+    asset = tx.get("asset") or "?"
+    quote = tx.get("quote_asset") or ""
+    price = Decimal(str(tx.get("price") or 0))
+    total = Decimal(str(tx.get("total_quote_value") or 0))
+    head = f"*{op}* `{tg._fmt(tx.get('amount') or 0)}` {asset}"
+    if price > 0 and quote:
+        head += f" @ `{tg._fmt(price)}` {quote}"
+    lines = [head]
+    if total > 0 and quote:
+        lines.append(f"Total: `{tg._fmt(total)}` {quote}")
+    src, dst = tx.get("source"), tx.get("destination")
+    if src or dst:
+        lines.append(f"{src or '—'} → {dst or '—'}")
+    fee = Decimal(str(tx.get("fee_amount") or 0))
+    if fee > 0:
+        lines.append(f"Fee: `{tg._fmt(fee)}` {tx.get('fee_asset') or asset}")
+    lines.append(f"Date: `{(tx.get('timestamp') or '')[:10]}`")
+    return "\n".join(lines)
+
+
+def _cmd_undo(text: str, chat_id: int, user_id: int) -> None:
+    """`/undo [confirm]` — remove the last transaction logged from chat (never imported history)."""
+    cfg = database.get_user_config(user_id, "last_tx_sk")
+    sk = ((cfg or {}).get("value") or "").strip()
+    tx = database.get_transaction(user_id, sk) if sk else None
+    if not tx or tx.get("imported"):
+        tg.send_message(chat_id, "_Nothing to undo. /undo removes only the last transaction you logged in this chat._")
+        return
+    parts = text.strip().split()
+    if len(parts) >= 2 and parts[1].lower() == "confirm":
+        database.delete_transaction(user_id, sk)
+        database.put_user_config(user_id, "last_tx_sk", "")
+        tg.send_message(chat_id, f"Removed:\n{_describe_tx(tx)}")
+        return
+    tg.send_message(chat_id, f"*Undo this transaction?*\n{_describe_tx(tx)}\n\nConfirm: `/undo confirm`")
+
+
+_PRICE_SANITY_RATIO = Decimal("2")  # implied unit price must be within 0.5×–2× of the reference
+_REFERENCE_MAX_AGE = timedelta(days=90)
+
+
+def _reference_price(user_id: int, asset: str, quote: str) -> Decimal | None:
+    """Recent price of 1 `asset` in `quote`: live CoinGecko for crypto vs a USD stablecoin,
+    otherwise the user's latest same-pair trade from the last 90 days."""
+    if quote in accounting._USD_PEGGED and asset in COINGECKO_IDS and asset not in accounting._USD_PEGGED:
+        live = _live_prices(user_id, [asset], "USD").get(asset)
+        if live:
+            return live
+    since = (datetime.now(timezone.utc) - _REFERENCE_MAX_AGE).isoformat()
+    for tx in database.query_transactions(user_id, asset=asset, since_iso=since, limit=50, descending=True):
+        if tx.get("operation") in llm_parser.TRADE_OPERATIONS and (tx.get("quote_asset") or "").upper() == quote:
+            p = Decimal(str(tx.get("price") or 0))
+            if p > 0:
+                return p
+    return None
+
+
+def _check_trade_price(parsed: dict, user_id: int) -> str | None:
+    """Catch a per-unit rate that was read as a total (or vice versa).
+
+    Mutates `parsed` when the alternative reading is the plausible one;
+    returns a clarification message when neither reading is plausible.
+    """
+    asset, quote = parsed.get("asset"), parsed.get("quote_asset")
+    amount = Decimal(str(parsed.get("amount") or 0))
+    price = Decimal(str(parsed.get("price") or 0))
+    if not asset or not quote or amount <= 0 or price <= 0:
+        return None
+    ref = _reference_price(user_id, asset, quote)
+    if not ref:
+        return None
+
+    def plausible(p: Decimal) -> bool:
+        return ref / _PRICE_SANITY_RATIO <= p <= ref * _PRICE_SANITY_RATIO
+
+    if plausible(price):
+        return None
+    stated = Decimal(str(parsed.get("total_quote_value") or 0))
+    if stated > 0 and plausible(stated):
+        # The number the user wrote is a unit rate, not the total.
+        parsed["price"] = stated
+        parsed["total_quote_value"] = stated * amount
+        return None
+    return (
+        f"_That works out to `{tg._fmt(price)}` {quote} per {asset}, but the recent price is "
+        f"about `{tg._fmt(ref)}` {quote}. Nothing was saved — please resend with the exact total, "
+        f"e.g. `bought 0.01 BTC for 650 USDT on Binance`._"
+    )
+
+
+def _normalize_timestamp(value, fallback: str) -> str:
+    """LLM timestamp → ISO-8601 UTC; unparsable values fall back so SK ordering stays sane."""
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return fallback
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
 def _cmd_freeform(text: str, chat_id: int, user_id: int, base_currency: str) -> None:
     now_iso = datetime.now(timezone.utc).isoformat()
     try:
         parsed = llm_parser.get_parser().parse(text, now_iso)
+    except llm_parser.IncompleteTradeError as e:
+        tg.send_message(chat_id, f"_Nothing was saved. {e}_")
+        return
     except llm_parser.LowConfidenceError as e:
         tg.send_message(chat_id, f"_I'm not sure I understood (confidence {e.partial.get('confidence', 0):.2f}). Could you clarify?_")
         return
@@ -1092,7 +1251,13 @@ def _cmd_freeform(text: str, chat_id: int, user_id: int, base_currency: str) -> 
                    parsed.get("amount"), parsed.get("raw_text", text))
         return
 
-    timestamp = parsed.get("timestamp") or now_iso
+    if op in llm_parser.TRADE_OPERATIONS:
+        problem = _check_trade_price(parsed, user_id)
+        if problem:
+            tg.send_message(chat_id, problem)
+            return
+
+    timestamp = _normalize_timestamp(parsed.get("timestamp") or now_iso, now_iso)
     tx = {
         "operation": op,
         "asset": parsed.get("asset"),
@@ -1108,20 +1273,18 @@ def _cmd_freeform(text: str, chat_id: int, user_id: int, base_currency: str) -> 
         "raw_text": parsed.get("raw_text", text),
         "imported": False,
     }
-    database.put_transaction(user_id, tx)
-    asset = tx["asset"] or "?"
-    amount = tx["amount"]
-    quote_str = ""
-    if tx.get("price") and tx.get("quote_asset"):
-        quote_str = f" @ {tx['price']} {tx['quote_asset']}"
+    _save_logged_tx(user_id, tx)
 
     strategy_hint = ""
-    if op in ("P2P_BUY", "SPOT_BUY", "P2P_SELL", "SPOT_SELL"):
+    if op in llm_parser.TRADE_OPERATIONS:
         cfg = database.get_user_config(user_id, "strategy")
         if cfg and cfg.get("value"):
             strategy_hint = "\n\n_Run /strategy to check your next step._"
 
-    tg.send_message(chat_id, f"Logged: *{op}* `{amount}` {asset}{quote_str}{strategy_hint}")
+    tg.send_message(
+        chat_id,
+        f"Logged: {_describe_tx(tx)}\n\n_Wrong? /undo removes it._{strategy_hint}",
+    )
 
 
 # ---------------------------------------------------------------------------

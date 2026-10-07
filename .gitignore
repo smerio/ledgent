@@ -33,3 +33,6 @@ WEBSITE_BRIEF.md
 
 # Import/utility scripts are personal-data-specific; not for public repo
 scripts/
+
+# DynamoDB repair backups (personal financial data)
+backups/

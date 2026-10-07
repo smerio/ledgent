@@ -91,6 +91,18 @@ def put_transaction(user_id: int | str, tx: dict) -> dict:
     return item
 
 
+def get_transaction(user_id: int | str, sk: str) -> dict | None:
+    resp = _table.get_item(Key={"PK": _user_pk(user_id), "SK": sk})
+    return resp.get("Item")
+
+
+def delete_transaction(user_id: int | str, sk: str) -> None:
+    """Delete one transaction item. Only `TX#` keys are accepted."""
+    if not sk.startswith("TX#"):
+        raise ValueError(f"Not a transaction key: {sk!r}")
+    _table.delete_item(Key={"PK": _user_pk(user_id), "SK": sk})
+
+
 def query_transactions(
     user_id: int | str,
     *,
@@ -480,10 +492,10 @@ def acquire_update_lock(user_id: int | str, update_id: int | str) -> bool:
         )
         return True
     except Exception as e:
-           if hasattr(e, "response") and e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-               return False
-           logger.warning("Failed to acquire update lock: %s", e)
-           return True
+        if hasattr(e, "response") and e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        logger.warning("Failed to acquire update lock: %s", e)
+        return True
 
 
 # ---------------------------------------------------------------------------

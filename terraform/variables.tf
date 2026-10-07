@@ -28,6 +28,17 @@ variable "telegram_bot_token" {
   sensitive   = true
 }
 
+variable "telegram_webhook_secret" {
+  description = "Secret Telegram sends in X-Telegram-Bot-Api-Secret-Token (setWebhook secret_token; 1-256 chars of A-Z a-z 0-9 _ -). Empty disables the check."
+  type        = string
+  sensitive   = true
+  default     = ""
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_-]{0,256}$", var.telegram_webhook_secret))
+    error_message = "telegram_webhook_secret may only contain A-Z, a-z, 0-9, _ and - (max 256 chars)."
+  }
+}
+
 variable "llm_provider" {
   description = "Which LLM provider parses incoming messages. One of: gemini, openai, claude."
   type        = string

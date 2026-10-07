@@ -15,7 +15,8 @@ tested and re-used as the on-the-fly compute path for /balance, /pnl, etc.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import bisect
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
 from typing import Iterable
@@ -56,8 +57,21 @@ def _usd_per_quote(tx: dict) -> Decimal:
     return ZERO
 
 
+def _ts_distance(a: str, b: str) -> float:
+    try:
+        dt_a = datetime.fromisoformat(a.replace("Z", "+00:00"))
+        dt_b = datetime.fromisoformat(b.replace("Z", "+00:00"))
+        return abs((dt_a - dt_b).total_seconds())
+    except Exception:
+        return float(abs(len(a) - len(b)))
+
+
 def _get_historical_price(asset: str, timestamp: str, price_index: dict[str, list[tuple[str, Decimal]]]) -> Decimal | None:
-    """Find the closest trade price for asset near timestamp."""
+    """Find the closest trade price for asset near timestamp.
+
+    `price_index[asset]` must be sorted by timestamp; the nearest entry is one
+    of the two neighbours of the bisect point.
+    """
     if not asset or not timestamp:
         return None
     if asset in _USD_PEGGED:
@@ -65,23 +79,9 @@ def _get_historical_price(asset: str, timestamp: str, price_index: dict[str, lis
     known = price_index.get(asset)
     if not known:
         return None
-    
-    best_price = None
-    min_diff = None
-    for ts, price in known:
-        try:
-            # Parse ISO timestamps
-            dt_a = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            dt_b = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-            diff = abs((dt_a - dt_b).total_seconds())
-        except Exception:
-            diff = abs(len(ts) - len(timestamp))
-            
-        if min_diff is None or diff < min_diff:
-            min_diff = diff
-            best_price = price
-            
-    return best_price
+    i = bisect.bisect_left(known, timestamp, key=lambda x: x[0])
+    candidates = known[max(i - 1, 0):i + 1]
+    return min(candidates, key=lambda x: _ts_distance(x[0], timestamp))[1]
 
 
 @dataclass
@@ -107,6 +107,7 @@ class ReplayState:
     realized_fx_pnl_usd: Decimal = ZERO                     # FX-rate component
     fees: dict = field(default_factory=dict)                # asset -> Decimal
     realized_fees_usd: Decimal = ZERO                       # historically valued fees in USD
+    unmatched_sells: dict = field(default_factory=dict)     # asset -> units sold beyond open lots (no PnL booked)
     transactions_processed: int = 0
 
     def add_balance(self, asset: str, location: str, delta: Decimal) -> None:
@@ -169,6 +170,33 @@ def _consume_and_book(state: ReplayState, lots: list[Lot], amount: Decimal,
         remaining -= take
         if lot.amount_remaining <= ZERO:
             lots.pop(0)
+    return remaining
+
+
+def _move_lots(lots: list[Lot], amount: Decimal, src: str, dst: str) -> None:
+    """Relocate `amount` units of FIFO lots held at `src` to `dst`, splitting a lot if needed.
+
+    Display-only bookkeeping (advisor context shows each lot's location);
+    cost basis and FIFO order are unchanged.
+    """
+    if not src or not dst or src.lower() == dst.lower():
+        return
+    remaining = amount
+    i = 0
+    while remaining > ZERO and i < len(lots):
+        lot = lots[i]
+        if (lot.location or "").lower() != src.lower():
+            i += 1
+            continue
+        if lot.amount_remaining <= remaining:
+            lot.location = dst
+            remaining -= lot.amount_remaining
+        else:
+            moved = replace(lot, lot_id=f"{lot.lot_id}:moved", amount_remaining=remaining, location=dst)
+            lot.amount_remaining -= remaining
+            lots.insert(i, moved)
+            remaining = ZERO
+        i += 1
 
 
 def _reduce_open_lots(lots: list[Lot], amount: Decimal) -> None:
@@ -241,7 +269,9 @@ def apply_transaction(state: ReplayState, tx: dict, price_index: dict | None = N
             state.add_balance(fee_asset, fee_loc, -fee_amount)
             state.add_fee(fee_asset, fee_amount, timestamp=ts, price_index=price_index)
         lots = state.open_lots.setdefault(asset, [])
-        _consume_and_book(state, lots, amount, price, usd_per_quote)
+        unmatched = _consume_and_book(state, lots, amount, price, usd_per_quote)
+        if unmatched > ZERO:
+            state.unmatched_sells[asset] = state.unmatched_sells.get(asset, ZERO) + unmatched
 
         if fee_amount > ZERO:
             _reduce_open_lots(state.open_lots.setdefault(fee_asset, []), fee_amount)
@@ -269,6 +299,7 @@ def apply_transaction(state: ReplayState, tx: dict, price_index: dict | None = N
         if fee_amount > ZERO:
             state.add_fee(fee_asset, fee_amount, timestamp=ts, price_index=price_index)
             _reduce_open_lots(state.open_lots.setdefault(fee_asset, []), fee_amount)
+        _move_lots(state.open_lots.get(asset, []), amount, src, dst)
 
     elif op == "INCOME":
         state.add_balance(asset, dst, amount)
@@ -329,13 +360,14 @@ def replay(transactions: Iterable[dict], base_currency: str = "USD") -> ReplaySt
     return state
 
 
-def unrealized_pnl_usd(state: ReplayState, price_lookup: dict) -> Decimal:
-    """Sum (current_USD_price − cost_per_unit_usd) × amount_remaining across open lots.
+def unrealized_breakdown_usd(state: ReplayState, price_lookup: dict) -> dict:
+    """Per-asset (current_USD_price − cost_per_unit_usd) × amount_remaining across open lots.
 
     `price_lookup` maps asset symbol → current price in USD. Assets without
-    a price entry are skipped.
+    a price entry or with a non-positive balance are skipped; lots are
+    scaled down when they exceed the wallet balance.
     """
-    total = ZERO
+    breakdown: dict = {}
     for asset, lots in state.open_lots.items():
         bal = state.total_balance(asset)
         if bal <= ZERO:
@@ -349,9 +381,16 @@ def unrealized_pnl_usd(state: ReplayState, price_lookup: dict) -> Decimal:
         if lots_sum > bal and lots_sum > ZERO:
             factor = bal / lots_sum
 
-        for lot in lots:
-            total += (price - lot.cost_per_unit_usd) * lot.amount_remaining * factor
-    return total
+        breakdown[asset] = sum(
+            ((price - lot.cost_per_unit_usd) * lot.amount_remaining * factor for lot in lots),
+            ZERO,
+        )
+    return breakdown
+
+
+def unrealized_pnl_usd(state: ReplayState, price_lookup: dict) -> Decimal:
+    """Total of `unrealized_breakdown_usd`."""
+    return sum(unrealized_breakdown_usd(state, price_lookup).values(), ZERO)
 
 
 def total_fees_in(state: ReplayState, base_currency: str, price_lookup: dict | None = None) -> Decimal:

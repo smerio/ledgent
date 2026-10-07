@@ -15,7 +15,8 @@ messages = [
   {"role": "assistant", "content": "Your profit is... What's BTC price?"},
   {"role": "user",      "content": "78201"},          ← added on continuation
 ]
-ttl = <epoch + 300>   ← 5-minute TTL; DynamoDB auto-deletes expired items
+ttl = <epoch + 300>   ← 5-minute TTL; code ignores expired items, DynamoDB TTL
+                        (enabled in Terraform since 2026-10-07) deletes them lazily
 ```
 
 The `messages` list is stored as a DynamoDB List-of-Maps. `_to_decimal`

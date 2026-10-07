@@ -65,6 +65,13 @@ resource "aws_dynamodb_table" "ledger" {
   point_in_time_recovery {
     enabled = true
   }
+
+  # Expire SESSION#, PRICE# and UPDATE# items (code also checks `ttl` itself,
+  # since DynamoDB deletes expired items lazily).
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
 }
 
 # ---------------------------------------------------------------------------
@@ -187,10 +194,18 @@ resource "aws_lambda_function" "bot" {
       LLM_API_KEY              = var.llm_api_key
       DYNAMODB_TABLE_NAME      = aws_dynamodb_table.ledger.name
       BASE_CURRENCY            = var.base_currency
+      TELEGRAM_WEBHOOK_SECRET  = var.telegram_webhook_secret
     }
   }
 
   depends_on = [aws_cloudwatch_log_group.bot]
+}
+
+# The bot self-invokes asynchronously; Lambda's default 2 retries would re-run
+# a timed-out request and could write the same transaction twice.
+resource "aws_lambda_function_event_invoke_config" "bot" {
+  function_name          = aws_lambda_function.bot.function_name
+  maximum_retry_attempts = 0
 }
 
 resource "aws_lambda_function" "nudge" {

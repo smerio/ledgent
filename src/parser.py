@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from abc import ABC, abstractmethod
+from decimal import Decimal, InvalidOperation
 
 import requests
 
@@ -25,6 +27,22 @@ class LowConfidenceError(ParseError):
     def __init__(self, message: str, partial: dict | None = None):
         super().__init__(message)
         self.partial = partial
+
+
+class IncompleteTradeError(ParseError):
+    """Raised for a buy/sell without a usable price or quote currency.
+
+    Saving such a trade would create a $0 cost-basis lot and skip the quote
+    leg of the balance, so the bot asks the user to restate it instead.
+    """
+
+
+TRADE_OPERATIONS = ("P2P_BUY", "P2P_SELL", "SPOT_BUY", "SPOT_SELL")
+
+# Quote currencies that are USD-pegged or fiat. A SELL of a stablecoin whose
+# quote is none of these is really a crypto purchase paid in that stablecoin.
+_USD_PEGGED = {"USD", "USDT", "USDC", "DAI", "BUSD", "FDUSD", "TUSD"}
+_FIAT = {"USD", "EUR", "RUB", "RSD", "GBP", "CHF", "TRY", "KZT", "UAH", "GEL", "AED", "THB"}
 
 
 VALID_OPERATIONS = [
@@ -49,7 +67,7 @@ JSON schema:
   "amount": positive number; for TRANSFER this is the amount that arrives at destination,
   "price": price of 1 unit of `asset` in `quote_asset` units; 0 for transfers/income/expense/set_balance/query,
   "quote_asset": currency/asset the price is denominated in; null if not applicable,
-  "total_quote_value": positive number representing the EXACT total proceeds or cost in quote_asset if explicitly mentioned in the message (e.g., 3550.37 in 'Swap ETH for 3550.37 USDC', 998 in 'Buy BTC for 998 USDT', or 639635.56 in 'Buy USDT using 639635.56 RSD'). This field is EXTREMELY CRITICAL for math accuracy. If the user states an exact total quote amount used or received, YOU MUST EXTRACT IT HERE. Null only if completely omitted,
+  "total_quote_value": positive number representing the EXACT total proceeds or cost in quote_asset if explicitly mentioned in the message (e.g., 3550.37 in 'Swap ETH for 3550.37 USDC', 998 in 'Buy BTC for 998 USDT', 639635.56 in 'Buy USDT using 639635.56 RSD', 71250 in 'bought 950 USDT, spent 71250 rub', 70000 in 'paid 70000 rub'). This field is EXTREMELY CRITICAL for math accuracy. If the user states an exact total quote amount used or received, YOU MUST EXTRACT IT HERE. If the user instead states a per-unit RATE (e.g. 'at 82.99 rub each', 'rate 74.67'), put it in `price` and leave this null. Null only if completely omitted,
   "source": wallet/exchange/bank name the asset comes FROM (free text, as the user said it),
   "destination": wallet/exchange/bank name the asset goes TO (free text),
   "fee": { "amount": number, "asset": ticker } or null,
@@ -62,6 +80,7 @@ Operation rules:
 - P2P_BUY:    bought crypto/stablecoin from a person via P2P, paid with fiat. The bought crypto/stablecoin goes to 'destination' (e.g., Bybit, Binance). The fiat is paid from 'source' (e.g., Tbank, Sberbank). If the paying bank is not mentioned but a P2P exchange is named (e.g., 'via P2P Bybit', 'on Bybit P2P', 'P2P Bybit'), map both 'source' and 'destination' to that exchange (e.g. source='Bybit', destination='Bybit'). Otherwise, set 'source' to null.
 - P2P_SELL:   sold crypto/stablecoin to a person via P2P, received fiat. The sold crypto/stablecoin comes from 'source' (e.g., Bybit, Binance). The fiat is received at 'destination' (e.g., Tbank, SRB Bank). If the receiving bank is not mentioned but a P2P exchange is named (e.g., 'via P2P Bybit', 'on Bybit P2P', 'P2P Bybit'), map both 'source' and 'destination' to that exchange (e.g. source='Bybit', destination='Bybit'). Otherwise, set 'destination' to null.
 - SPOT_BUY:   bought asset on an exchange spot market. The bought asset goes to 'destination'. The quote asset used to pay comes from 'source'. Usually 'source' and 'destination' are the same exchange (e.g., Binance, Bybit).
+              Converting a stablecoin INTO crypto is a SPOT_BUY of the crypto, never a SPOT_SELL of the stablecoin. E.g. 'Convert 475 usdt to 0.00612053 BTC on binance' or 'sold 500 USDT for 0.0063 BTC' → operation=SPOT_BUY, asset=BTC, amount=0.00612053, quote_asset=USDT, total_quote_value=475.
 - SPOT_SELL:  sold asset on an exchange spot market. The sold asset comes from 'source'. The quote asset received goes to 'destination'. Usually 'source' and 'destination' are the same exchange (e.g., Binance, Bybit).
 - TRANSFER:   moved an asset between wallets/exchanges (no ownership change). The asset is the same on both sides. The asset comes from 'source' and goes to 'destination'.
 - INCOME:     received staking rewards, airdrop, interest
@@ -77,6 +96,7 @@ Operation rules:
 Rules:
 - Never invent numbers. If a field is unclear, lower `confidence`.
 - amount is always positive. Direction comes from operation type.
+- For P2P_BUY / P2P_SELL / SPOT_BUY / SPOT_SELL always set quote_asset. If the message gives no currency for the price or total, lower `confidence`.
 - If the user provides slash commands like /balance, /pnl, /history, /unrealized, /fees, /stats, /help — operation is QUERY.
 - Output ONLY the JSON object. No prose.
 """
@@ -112,6 +132,61 @@ class LLMParser(ABC):
         """
 
 
+def _to_dec(value) -> Decimal | None:
+    """Positive Decimal from an LLM/regex value, or None when absent/invalid."""
+    if value is None or value == "":
+        return None
+    try:
+        d = Decimal(str(value).replace(",", ""))
+    except InvalidOperation:
+        return None
+    return d if d > 0 else None
+
+
+def _extract_total_from_text(raw_text: str, quote_asset: str) -> Decimal | None:
+    """Deterministic fallback: '<keyword> <number> <QUOTE>' → number.
+
+    The number may be a total ('for 100000 RUB') or a per-unit rate
+    ('for 82.99 RUB'); the handler's plausibility check resolves which.
+    """
+    qa = re.escape(quote_asset)
+    m = re.search(
+        rf"(?:using|for|from|spent|paid|to)\s+([\d,]+(?:\.\d+)?)\s*{qa}\b",
+        raw_text,
+        re.IGNORECASE,
+    )
+    return _to_dec(m.group(1)) if m else None
+
+
+def _rewrite_stable_to_crypto(payload: dict) -> None:
+    """'sold 500 USDT for 0.0063 BTC' → SPOT_BUY 0.0063 BTC paid with 500 USDT.
+
+    Booked as a SELL, the received crypto gets no lot (no cost basis) and,
+    without a total, is never credited to the balance.
+    """
+    asset = payload.get("asset") or ""
+    quote = payload.get("quote_asset") or ""
+    if payload.get("operation") not in ("SPOT_SELL", "P2P_SELL"):
+        return
+    if asset not in _USD_PEGGED or not quote or quote in _USD_PEGGED or quote in _FIAT:
+        return
+    amount = _to_dec(payload.get("amount"))
+    received = _to_dec(payload.get("total_quote_value"))
+    price = _to_dec(payload.get("price"))
+    if received is None and amount and price:
+        received = amount * price
+    if not amount or not received:
+        return  # left incomplete; the trade check below asks the user
+    payload.update({
+        "operation": "SPOT_BUY",
+        "asset": quote,
+        "amount": received,
+        "quote_asset": asset,
+        "total_quote_value": amount,
+        "price": amount / received,
+    })
+
+
 def _validate(payload: dict, raw_text: str) -> dict:
     if not isinstance(payload, dict):
         raise ParseError(f"LLM did not return a JSON object: {payload!r}")
@@ -120,33 +195,23 @@ def _validate(payload: dict, raw_text: str) -> dict:
         raise ParseError(f"Invalid operation: {op!r}")
     payload.setdefault("raw_text", raw_text)
     payload.setdefault("confidence", 0.0)
+    for key in ("asset", "quote_asset", "fee_asset"):
+        if isinstance(payload.get(key), str):
+            payload[key] = payload[key].strip().upper() or None
 
-    # Programmatic override of price if total_quote_value and amount are present
-    total_quote = payload.get("total_quote_value")
     quote_asset = payload.get("quote_asset")
-    
-    # Deterministic fallback: extract total quote value from text if missed by LLM
+    total_quote = _to_dec(payload.get("total_quote_value"))
     if total_quote is None and raw_text and quote_asset:
-        import re
-        qa = re.escape(quote_asset)
-        m = re.search(rf'(?:using|for|from)\s+([\d,]+(?:\.\d+)?)\s*{qa}\b', raw_text, re.IGNORECASE)
-        if m:
-            try:
-                total_quote = float(m.group(1).replace(',', ''))
-                payload["total_quote_value"] = total_quote
-            except ValueError:
-                pass
+        total_quote = _extract_total_from_text(raw_text, quote_asset)
+    payload["total_quote_value"] = total_quote
 
-    amount = payload.get("amount")
+    _rewrite_stable_to_crypto(payload)
+
+    # An explicit total wins over the LLM's (often rounded) unit price.
+    amount = _to_dec(payload.get("amount"))
+    total_quote = payload.get("total_quote_value")
     if total_quote is not None and amount:
-        try:
-            from decimal import Decimal
-            total_dec = Decimal(str(total_quote))
-            amount_dec = Decimal(str(amount))
-            if amount_dec > 0 and total_dec > 0:
-                payload["price"] = float(total_dec / amount_dec)
-        except Exception:
-            pass
+        payload["price"] = total_quote / amount
 
     fee = payload.get("fee")
     if isinstance(fee, dict):
@@ -155,6 +220,15 @@ def _validate(payload: dict, raw_text: str) -> dict:
     else:
         payload.setdefault("fee_amount", 0)
         payload.setdefault("fee_asset", None)
+
+    if payload["operation"] in TRADE_OPERATIONS:
+        if not payload.get("quote_asset") or not _to_dec(payload.get("price")):
+            raise IncompleteTradeError(
+                "Couldn't find the price and currency for this trade. Please include "
+                "the total you paid or received, e.g. "
+                "`bought 1339 USDT for 100000 RUB on Bybit P2P`."
+            )
+
     if op != "QUERY" and float(payload.get("confidence", 0)) < 0.7:
         raise LowConfidenceError(
             f"Low confidence parse: {payload.get('confidence')}",
@@ -292,6 +366,10 @@ _CLAUDE_TOOL = {
             "amount": {"type": ["number", "null"]},
             "price": {"type": ["number", "null"]},
             "quote_asset": {"type": ["string", "null"]},
+            "total_quote_value": {
+                "type": ["number", "null"],
+                "description": "Exact total paid/received in quote_asset if the user states it; null for a per-unit rate.",
+            },
             "source": {"type": ["string", "null"]},
             "destination": {"type": ["string", "null"]},
             "fee": {
