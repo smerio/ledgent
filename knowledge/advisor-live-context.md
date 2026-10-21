@@ -2,9 +2,16 @@
 
 Updated 2026-05-25: Added physical flow metadata ([source → destination]) to transaction history lines to eliminate LLM transfer/fiat hallucinations.
 
-## What's in the advisor context (as of 2026-05-25)
+Updated 2026-10-21: the context starts with `=== TODAY ===`. Tx lines (built by
+`_advisor_tx_line`) add the total quote, fees and a reconcile marker. `/strategy`
+replaces the flat list with a CURRENT CYCLE section; see [[strategy-cycle-detection]].
+
+## What's in the advisor context (as of 2026-10-21)
 
 ```
+=== TODAY ===
+YYYY-MM-DD HH:MM UTC
+
 === BALANCES ===
 BTC: X.XXXX (A.AA@Exchange1, B.BB@Exchange2)
 ...
@@ -20,11 +27,16 @@ BTC: X.XXXX (A.AA@Exchange1, B.BB@Exchange2)
   USDT: XXXX.XX @ avg $1.00/unit
   EUR: ...
 
+=== LAST N TRANSACTIONS (newest first) ===        (/ask)
+  YYYY-MM-DD [Op] [Amount] [Asset] @ [Price] [Quote] (total [T] [Quote]) [[Src] → [Dst]] fee [F] [FeeAsset] (balance reconcile, not a trade)
+
+=== CURRENT CYCLE: K TRANSACTIONS SINCE THE ENTRY (oldest first) ===   (/strategy only)
+  1. <entry line>
+  2. ...
+=== EARLIER M TRANSACTIONS (previous cycles, newest first) ===
+
 === LIVE PRICES (current market) ===
   BTC: $XX,XXX USD
-
-=== LAST 25 TRANSACTIONS (newest first) ===
-  YYYY-MM-DD [Operation] [Amount] [Asset] @ [Price] [Quote] [[Source] → [Destination]]
 
 === USER INSTRUCTIONS FOR ADVISOR ===
   (if set via /context)
