@@ -277,15 +277,17 @@ def apply_transaction(state: ReplayState, tx: dict, price_index: dict | None = N
             _reduce_open_lots(state.open_lots.setdefault(fee_asset, []), fee_amount)
 
     elif op == "TRANSFER":
-        is_imported = tx.get("imported", False)
+        # Imported rows and chat transfers logged since 2026-10-21 (`amount_is_net`)
+        # store the amount that arrived; older chat rows stored the gross amount sent.
+        is_net = tx.get("imported", False) or tx.get("amount_is_net", False)
         if fee_asset == asset:
-            if is_imported:
-                # Imported (Case 2: Net-Receive): amount is the net amount received.
+            if is_net:
+                # Net-Receive (Case 2): amount is the net amount received.
                 # Source is debited the gross amount (amount + fee).
                 state.add_balance(asset, src, -(amount + fee_amount))
                 state.add_balance(asset, dst, amount)
             else:
-                # Manual (Case 1: Gross-Send): amount is the gross amount sent.
+                # Legacy chat rows (Case 1: Gross-Send): amount is the gross amount sent.
                 # Destination receives the net amount (amount - fee).
                 state.add_balance(asset, src, -amount)
                 state.add_balance(asset, dst, amount - fee_amount)

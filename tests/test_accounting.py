@@ -32,6 +32,7 @@ def _tx(**kwargs) -> dict:
         "quote_per_usd": kwargs.get("quote_per_usd", 0),
         "raw_text": kwargs.get("raw_text", ""),
         "imported": kwargs.get("imported", False),
+        "amount_is_net": kwargs.get("amount_is_net", False),
     }
 
 
@@ -149,6 +150,23 @@ class TestTransferAndBalances(unittest.TestCase):
         self.assertEqual(state.balances["BTC"]["Ledger"], Decimal("0.0299"))  # Destination receives amount - fee
         self.assertEqual(state.total_balance("BTC"), Decimal("0.0499"))
         self.assertEqual(state.fees["BTC"], Decimal("0.0001"))
+
+    def test_chat_transfer_net_amount_drains_source(self):
+        # 2026-10-21: "sent 0.00689548 btc from bybit to Ledger fee 0.000057 btc"
+        # with exactly 0.00695248 on Bybit must leave Bybit at zero.
+        txs = [
+            _tx(operation="SPOT_BUY", asset="BTC", amount="0.00695248", price="84861.76",
+                quote_asset="USDT", source="Bybit", destination="Bybit",
+                quote_per_usd="1", timestamp="2026-10-21T12:29:00Z"),
+            _tx(operation="TRANSFER", asset="BTC", amount="0.00689548",
+                fee_amount="0.000057", fee_asset="BTC",
+                source="Bybit", destination="Ledger",
+                imported=False, amount_is_net=True, timestamp="2026-10-21T12:34:00Z"),
+        ]
+        state = replay(txs)
+        self.assertEqual(state.balances["BTC"]["Bybit"], ZERO)
+        self.assertEqual(state.balances["BTC"]["Ledger"], Decimal("0.00689548"))
+        self.assertEqual(state.fees["BTC"], Decimal("0.000057"))
 
 
 class TestFeeAccumulation(unittest.TestCase):

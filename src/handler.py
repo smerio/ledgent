@@ -603,7 +603,9 @@ def _reconcile(chat_id: int, user_id: int, asset, location, target_amount, note:
 
 def _build_portfolio_context(state, recent_txs: list, advisor_note: str = "", live_prices: dict | None = None) -> str:
     """Compact portfolio summary for the LLM advisor."""
-    lines = ["=== BALANCES ==="]
+    # Without today's date the advisor guesses how far into a cycle the user is.
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [f"=== TODAY ===\n{now}", "\n=== BALANCES ==="]
     for asset in sorted(state.balances):
         locs = state.balances[asset]
         total = sum(locs.values(), Decimal("0"))
@@ -662,7 +664,9 @@ def _build_portfolio_context(state, recent_txs: list, advisor_note: str = "", li
         src = tx.get("source") or ""
         dest = tx.get("destination") or ""
         flow_s = f" [{src} → {dest}]" if src or dest else ""
-        lines.append(f"  {ts} {op} {tg._fmt(amount)} {asset}{price_s}{flow_s}")
+        fee = Decimal(str(tx.get("fee_amount") or 0))
+        fee_s = f" fee {tg._fmt(fee)} {tx.get('fee_asset') or asset}" if fee > 0 else ""
+        lines.append(f"  {ts} {op} {tg._fmt(amount)} {asset}{price_s}{flow_s}{fee_s}")
 
     if live_prices:
         price_lines = [f"  {a}: ${tg._fmt(p)} USD" for a, p in sorted(live_prices.items())]
@@ -853,10 +857,16 @@ def _cmd_strategy(text: str, chat_id: int, user_id: int) -> None:
     context = _build_portfolio_context(state, recent_txs, advisor_note=advisor_note, live_prices=live_prices)
     prompt = (
         f"My personal trading strategy:\n{strategy_text}\n\n"
+        "How to read my history: a cycle starts ONLY with a transaction that matches the "
+        "strategy's ENTRY definition. Find the most recent one. Every later transaction "
+        "(conversions, transfers, sells) is a step of that same cycle, never a new entry. "
+        "Use TODAY from the portfolio data as the current date; do not guess it.\n\n"
         "Based on my portfolio and recent transactions answer:\n"
-        "1. What is my next step in this strategy?\n"
-        "2. What exact amount should I trade and in which direction?\n"
-        "3. If there is a timing element, what date should I act by?"
+        "1. Current cycle: entry date and amount, and which strategy steps the later "
+        "transactions already completed (one line each).\n"
+        "2. Deviations: where my actual amounts or venues differ from the strategy, with numbers.\n"
+        "3. What is my next step, what exact amount, in which direction?\n"
+        "4. If there is a timing element, what date should I act by?"
     )
     tg.send_message(chat_id, "_Analyzing…_")
     try:
@@ -1142,6 +1152,9 @@ def _describe_tx(tx: dict) -> str:
     fee = Decimal(str(tx.get("fee_amount") or 0))
     if fee > 0:
         lines.append(f"Fee: `{tg._fmt(fee)}` {tx.get('fee_asset') or asset}")
+        if op == "TRANSFER" and tx.get("amount_is_net") and (tx.get("fee_asset") or asset) == asset:
+            amount = Decimal(str(tx.get("amount") or 0))
+            lines.append(f"Debited from {src or '—'}: `{tg._fmt(amount + fee)}` {asset}")
     lines.append(f"Date: `{(tx.get('timestamp') or '')[:10]}`")
     return "\n".join(lines)
 
@@ -1273,6 +1286,9 @@ def _cmd_freeform(text: str, chat_id: int, user_id: int, base_currency: str) -> 
         "raw_text": parsed.get("raw_text", text),
         "imported": False,
     }
+    if op == "TRANSFER":
+        # The parser returns the amount that arrives; the fee comes on top.
+        tx["amount_is_net"] = True
     _save_logged_tx(user_id, tx)
 
     strategy_hint = ""
