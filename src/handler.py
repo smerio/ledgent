@@ -601,7 +601,50 @@ def _reconcile(chat_id: int, user_id: int, asset, location, target_amount, note:
     )
 
 
-def _build_portfolio_context(state, recent_txs: list, advisor_note: str = "", live_prices: dict | None = None) -> str:
+def _advisor_tx_line(tx: dict) -> str:
+    """One transaction as a compact line for the LLM advisor."""
+    ts = (tx.get("timestamp") or "")[:10]
+    op = tx.get("operation", "?")
+    asset = tx.get("asset", "?")
+    amount = tx.get("amount", 0)
+    price = Decimal(str(tx.get("price") or 0))
+    total = Decimal(str(tx.get("total_quote_value") or 0))
+    quote = tx.get("quote_asset") or ""
+    price_s = f" @ {tg._fmt(price)} {quote}" if price > 0 and quote else ""
+    total_s = f" (total {tg._fmt(total)} {quote})" if total > 0 and quote else ""
+    src = tx.get("source") or ""
+    dest = tx.get("destination") or ""
+    flow_s = f" [{src} → {dest}]" if src or dest else ""
+    fee = Decimal(str(tx.get("fee_amount") or 0))
+    fee_s = f" fee {tg._fmt(fee)} {tx.get('fee_asset') or asset}" if fee > 0 else ""
+    recon_s = " (balance reconcile, not a trade)" if "reconcil" in (tx.get("raw_text") or "").lower() else ""
+    return f"{ts} {op} {tg._fmt(amount)} {asset}{price_s}{total_s}{flow_s}{fee_s}{recon_s}"
+
+
+def _is_cycle_entry(tx: dict) -> bool:
+    """A fresh fiat input: crypto/stablecoin bought with fiat (e.g. USDT with RUB)."""
+    return (
+        tx.get("operation") in ("P2P_BUY", "SPOT_BUY")
+        and (tx.get("quote_asset") or "").upper() in llm_parser._FIAT
+        and "reconcil" not in (tx.get("raw_text") or "").lower()
+    )
+
+
+def _split_current_cycle(txs_newest_first: list) -> tuple[list, list]:
+    """Split into (current cycle oldest-first, earlier txs newest-first).
+
+    The cycle starts at the latest fiat-funded buy. Finding it in code is
+    more reliable than asking the advisor to: Haiku anchored on an older
+    entry and mixed earlier P2P sells into the current cycle.
+    """
+    for i, tx in enumerate(txs_newest_first):
+        if _is_cycle_entry(tx):
+            return list(reversed(txs_newest_first[: i + 1])), txs_newest_first[i + 1:]
+    return [], txs_newest_first
+
+
+def _build_portfolio_context(state, recent_txs: list, advisor_note: str = "", live_prices: dict | None = None,
+                             cycle_txs: list | None = None) -> str:
     """Compact portfolio summary for the LLM advisor."""
     # Without today's date the advisor guesses how far into a cycle the user is.
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -652,21 +695,14 @@ def _build_portfolio_context(state, recent_txs: list, advisor_note: str = "", li
         lines.append("\n=== STABLECOIN / FIAT POSITIONS (aggregate cost basis) ===")
         lines.extend(aggregate_lines)
 
-    lines.append(f"\n=== LAST {len(recent_txs)} TRANSACTIONS (newest first) ===")
-    for tx in recent_txs:
-        ts = (tx.get("timestamp") or "")[:10]
-        op = tx.get("operation", "?")
-        asset = tx.get("asset", "?")
-        amount = tx.get("amount", 0)
-        price = Decimal(str(tx.get("price") or 0))
-        quote = tx.get("quote_asset") or ""
-        price_s = f" @ {tg._fmt(price)} {quote}" if price > 0 and quote else ""
-        src = tx.get("source") or ""
-        dest = tx.get("destination") or ""
-        flow_s = f" [{src} → {dest}]" if src or dest else ""
-        fee = Decimal(str(tx.get("fee_amount") or 0))
-        fee_s = f" fee {tg._fmt(fee)} {tx.get('fee_asset') or asset}" if fee > 0 else ""
-        lines.append(f"  {ts} {op} {tg._fmt(amount)} {asset}{price_s}{flow_s}{fee_s}")
+    if cycle_txs:
+        lines.append(f"\n=== CURRENT CYCLE: {len(cycle_txs)} TRANSACTIONS SINCE THE ENTRY (oldest first) ===")
+        lines.extend(f"  {i}. {_advisor_tx_line(tx)}" for i, tx in enumerate(cycle_txs, 1))
+        heading = f"EARLIER {len(recent_txs)} TRANSACTIONS (previous cycles, newest first)"
+    else:
+        heading = f"LAST {len(recent_txs)} TRANSACTIONS (newest first)"
+    lines.append(f"\n=== {heading} ===")
+    lines.extend(f"  {_advisor_tx_line(tx)}" for tx in recent_txs)
 
     if live_prices:
         price_lines = [f"  {a}: ${tg._fmt(p)} USD" for a, p in sorted(live_prices.items())]
@@ -849,17 +885,24 @@ def _cmd_strategy(text: str, chat_id: int, user_id: int) -> None:
         return
 
     state = _replay_state(user_id)
-    recent_txs = database.query_transactions(user_id, limit=15, descending=True)
+    recent_txs = database.query_transactions(user_id, limit=30, descending=True)
+    cycle_txs, earlier_txs = _split_current_cycle(recent_txs)
+    if cycle_txs:
+        earlier_txs = earlier_txs[:8]
     cfg = database.get_user_config(user_id, "advisor_note")
     advisor_note = (cfg.get("value") or "").strip() if cfg else ""
     crypto_assets = [a for a in state.open_lots if a in COINGECKO_IDS]
     live_prices = _live_prices(user_id, crypto_assets, "USD") if crypto_assets else {}
-    context = _build_portfolio_context(state, recent_txs, advisor_note=advisor_note, live_prices=live_prices)
+    context = _build_portfolio_context(state, earlier_txs if cycle_txs else recent_txs[:15],
+                                       advisor_note=advisor_note, live_prices=live_prices,
+                                       cycle_txs=cycle_txs)
     prompt = (
         f"My personal trading strategy:\n{strategy_text}\n\n"
-        "How to read my history: a cycle starts ONLY with a transaction that matches the "
-        "strategy's ENTRY definition. Find the most recent one. Every later transaction "
-        "(conversions, transfers, sells) is a step of that same cycle, never a new entry. "
+        "How to read my history: CURRENT CYCLE lists, oldest first, my latest fiat-funded "
+        "buy (the ENTRY, item 1) and every transaction after it. Those later items are steps "
+        "of this cycle, never a new entry. Judge the cycle only from these items and the "
+        "current BALANCES. Ignore reconcile lines. EARLIER transactions belong to previous "
+        "cycles: mention them only if an exit from a previous cycle is still pending. "
         "Use TODAY from the portfolio data as the current date; do not guess it.\n\n"
         "Based on my portfolio and recent transactions answer:\n"
         "1. Current cycle: entry date and amount, and which strategy steps the later "

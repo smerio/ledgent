@@ -293,3 +293,51 @@ class TestTimestampNormalization(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStrategyCycle(unittest.TestCase):
+    """/strategy hands the advisor the current cycle, found in code (2026-10-21)."""
+
+    def _history(self):
+        # Newest first, as query_transactions(descending=True) returns it.
+        return [
+            _tx(operation="INCOME", asset="BTC", amount="0.00017", destination="Ledger",
+                raw_text="reconcile BTC@Ledger", timestamp="2026-10-21T13:47:00+00:00"),
+            _tx(operation="TRANSFER", asset="BTC", amount="0.00689548", source="Bybit",
+                destination="Ledger", fee_amount="0.000057", fee_asset="BTC",
+                timestamp="2026-10-21T13:45:00+00:00"),
+            _tx(operation="SPOT_BUY", asset="BTC", amount="0.00695248", price="84861.76",
+                quote_asset="USDT", total_quote_value="590", source="Bybit", destination="Bybit",
+                timestamp="2026-10-21T13:28:00+00:00"),
+            _tx(operation="P2P_BUY", asset="USDT", amount="1180", price="84.7458",
+                quote_asset="RUB", source="Tbank", destination="Bybit",
+                timestamp="2026-10-21T13:22:00+00:00"),
+            _tx(operation="P2P_SELL", asset="USDT", amount="500", price="100",
+                quote_asset="RSD", source="Bybit", destination="Raiffeisen",
+                timestamp="2026-10-10T10:00:00+00:00"),
+            _tx(operation="P2P_BUY", asset="USDT", amount="1080", price="87.963",
+                quote_asset="RUB", source="Tbank", destination="Bybit",
+                timestamp="2026-10-08T10:00:00+00:00"),
+        ]
+
+    def test_cycle_starts_at_latest_fiat_funded_buy(self):
+        cycle, earlier = handler._split_current_cycle(self._history())
+        self.assertEqual([t["operation"] for t in cycle],
+                         ["P2P_BUY", "SPOT_BUY", "TRANSFER", "INCOME"])
+        self.assertEqual(cycle[0]["amount"], "1180")
+        self.assertEqual([t["timestamp"][:10] for t in earlier], ["2026-10-10", "2026-10-08"])
+
+    def test_usdt_to_btc_conversion_is_not_an_entry(self):
+        cycle, _ = handler._split_current_cycle(self._history()[:3])
+        self.assertEqual(cycle, [])
+
+    def test_context_lists_cycle_and_marks_reconcile(self):
+        cycle, earlier = handler._split_current_cycle(self._history())
+        state = accounting.replay([])
+        ctx = handler._build_portfolio_context(state, earlier, cycle_txs=cycle)
+        self.assertIn("=== TODAY ===", ctx)
+        self.assertIn("CURRENT CYCLE: 4 TRANSACTIONS", ctx)
+        self.assertIn("1. 2026-10-21 P2P_BUY 1180 USDT", ctx)
+        self.assertIn("(total 590 USDT)", ctx)
+        self.assertIn("(balance reconcile, not a trade)", ctx)
+        self.assertIn("EARLIER 2 TRANSACTIONS", ctx)
